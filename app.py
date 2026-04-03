@@ -2,6 +2,7 @@ import sys
 import os
 from pathlib import Path
 import traceback
+import ast
 
 try:
     from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
@@ -40,88 +41,171 @@ try:
 except ImportError:
     OPENPYXL_AVAILABLE = False
 
+DEFAULT_NUM_FRAMES = 30
+INPUT_DIM = 126
 
-def create_model(num_classes=100, input_dim=126):
+
+def create_model(num_classes=100, input_dim=INPUT_DIM):
     """Create the sign language model architecture."""
     from models import TemporalTransformer
     return TemporalTransformer(input_dim=input_dim, num_classes=num_classes)
 
 
 def load_dataset(file_path):
-    """Load dataset from various formats.
-    
-    Supported formats:
-    - JSON: List of {"landmarks": [...], "label": "class"} or {"data": [...], "labels": [...]}
-    - CSV/Excel: Columns for landmarks, with label column
-    - NumPy: Direct array
-    """
+    """Load dataset from file. Supports JSON, CSV, Excel, NumPy."""
     path = Path(file_path)
     ext = path.suffix.lower()
     
     if ext == '.json':
-        with open(file_path, 'r') as f:
-            data = json.load(f)
-        
-        if isinstance(data, list):
-            samples = []
-            labels = []
-            for item in data:
-                if 'landmarks' in item:
-                    samples.append(np.array(item['landmarks']))
-                elif 'data' in item:
-                    samples.append(np.array(item['data']))
-                labels.append(item.get('label', item.get('class', 'unknown')))
-            return samples, labels
-        elif isinstance(data, dict):
-            if 'data' in data and 'labels' in data:
-                return [np.array(x) for x in data['data']], data['labels']
-            elif 'landmarks' in data:
-                return [np.array(x) for x in data['landmarks']], data.get('labels', [])
-    
+        return _load_json_dataset(file_path)
     elif ext in ['.csv', '.xlsx', '.xls']:
-        if ext == '.csv':
-            df = pd.read_csv(file_path)
-        else:
-            df = pd.read_excel(file_path)
-        
-        samples = []
-        labels = []
-        
-        label_col = None
-        for col in ['label', 'class', 'target', 'y']:
-            if col in df.columns:
-                label_col = col
-                break
-        
-        feature_cols = [c for c in df.columns if c != label_col]
-        
-        for idx in range(len(df)):
-            row_data = df[feature_cols].iloc[idx]
-            if row_data.dtype == object:
-                try:
-                    sample = np.array(eval(row_data.iloc[0]))
-                except:
-                    sample = np.array(row_data.values, dtype=np.float32)
-            else:
-                sample = row_data.values.astype(np.float32)
-            
-            if sample.ndim == 1 and len(sample) % 126 == 0:
-                num_frames = len(sample) // 126
-                sample = sample.reshape(num_frames, 126)
-            
-            samples.append(sample)
-            if label_col:
-                labels.append(str(df[label_col].iloc[idx]))
-            else:
-                labels.append('unknown')
-        
-        return samples, labels
-    
+        return _load_tabular_dataset(file_path, ext)
     elif ext == '.npy':
-        data = np.load(file_path)
-        return data, ['unknown'] * len(data)
+        return _load_npy_dataset(file_path)
     
     return None, None
+
+
+def load_dataset_from_dataframe(df, label_column=None):
+    """Load dataset from a Pandas DataFrame.
+    
+    Args:
+        df: Pandas DataFrame with landmark data and optional label column
+        label_column: Name of the column containing labels. Auto-detected if None.
+    
+    Returns:
+        Tuple of (samples, labels) where samples is a list of numpy arrays
+    """
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("Input must be a Pandas DataFrame")
+    
+    if df.empty:
+        raise ValueError("DataFrame is empty")
+    
+    if label_column is None:
+        label_column = _detect_label_column(df)
+    
+    feature_cols = [c for c in df.columns if c != label_column]
+    
+    if not feature_cols:
+        raise ValueError("No feature columns found in DataFrame")
+    
+    samples = []
+    labels = []
+    
+    for idx in range(len(df)):
+        row_data = df[feature_cols].iloc[idx]
+        
+        if row_data.dtype == object and len(feature_cols) == 1:
+            try:
+                val = row_data.iloc[0]
+                if isinstance(val, str):
+                    sample = np.array(ast.literal_eval(val), dtype=np.float32)
+                elif isinstance(val, (list, np.ndarray)):
+                    sample = np.array(val, dtype=np.float32)
+                else:
+                    sample = np.array([float(val)], dtype=np.float32)
+            except:
+                try:
+                    sample = np.array(row_data.values.tolist(), dtype=np.float32)
+                except:
+                    continue
+        else:
+            try:
+                sample = np.array(row_data.values.tolist(), dtype=np.float32)
+            except:
+                continue
+        
+        if sample.ndim == 1 and len(sample) % INPUT_DIM == 0 and len(sample) > 0:
+            num_frames = len(sample) // INPUT_DIM
+            sample = sample.reshape(num_frames, INPUT_DIM)
+        
+        samples.append(sample)
+        
+        if label_column:
+            labels.append(str(df[label_column].iloc[idx]))
+        else:
+            labels.append('unknown')
+    
+    if not samples:
+        raise ValueError("Could not extract any valid samples from DataFrame")
+    
+    return samples, labels
+
+
+def _load_json_dataset(file_path):
+    """Load dataset from JSON file."""
+    with open(file_path, 'r') as f:
+        data = json.load(f)
+    
+    if isinstance(data, list):
+        return _parse_json_list(data)
+    elif isinstance(data, dict):
+        return _parse_json_dict(data)
+    
+    return None, None
+
+
+def _parse_json_list(data):
+    """Parse JSON list format: [{"landmarks": [...], "label": "class"}, ...]"""
+    samples = []
+    labels = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        if 'landmarks' in item:
+            samples.append(np.array(item['landmarks'], dtype=np.float32))
+        elif 'data' in item:
+            samples.append(np.array(item['data'], dtype=np.float32))
+        else:
+            continue
+        labels.append(item.get('label', item.get('class', 'unknown')))
+    return samples, labels
+
+
+def _parse_json_dict(data):
+    """Parse JSON dict format: {"data": [...], "labels": [...]}"""
+    if 'data' in data and 'labels' in data:
+        return [np.array(x, dtype=np.float32) for x in data['data']], data['labels']
+    elif 'landmarks' in data:
+        return [np.array(x, dtype=np.float32) for x in data['landmarks']], data.get('labels', [])
+    return None, None
+
+
+def _load_tabular_dataset(file_path, ext):
+    """Load dataset from CSV or Excel file."""
+    if ext == '.csv':
+        df = pd.read_csv(file_path)
+    else:
+        df = pd.read_excel(file_path)
+    
+    return load_dataset_from_dataframe(df)
+
+
+def _load_npy_dataset(file_path):
+    """Load dataset from NumPy file."""
+    data = np.load(file_path)
+    if data.ndim == 2:
+        return [data[i] for i in range(len(data))], ['unknown'] * len(data)
+    elif data.ndim == 3:
+        return [data[i] for i in range(len(data))], ['unknown'] * len(data)
+    else:
+        return [data], ['unknown']
+
+
+def _detect_label_column(df):
+    """Auto-detect the label column in a DataFrame."""
+    for col in ['label', 'class', 'target', 'y', 'sign', 'gesture', 'category']:
+        if col in df.columns:
+            return col
+    
+    for col in df.columns:
+        if df[col].dtype == object:
+            unique_count = df[col].nunique()
+            if 1 < unique_count < len(df) * 0.5:
+                return col
+    
+    return None
 
 
 class LandmarkExtractor(QThread):
@@ -172,7 +256,7 @@ class LandmarkExtractor(QThread):
                 
                 hand_features = self._extract_hands(results)
                 
-                self.frame_ready.emit(frame, hand_features)
+                self.frame_ready.emit(frame.copy(), hand_features.copy())
                 
         except Exception as e:
             self.error_occurred.emit(f"Camera error: {str(e)}")
@@ -181,7 +265,7 @@ class LandmarkExtractor(QThread):
                 self._holistic.close()
         
     def _extract_hands(self, results):
-        features = np.zeros(126, dtype=np.float32)
+        features = np.zeros(INPUT_DIM, dtype=np.float32)
         
         if results.left_hand_landmarks:
             for i, lm in enumerate(results.left_hand_landmarks.landmark[:21]):
@@ -204,6 +288,99 @@ class LandmarkExtractor(QThread):
         self.wait(2000)
 
 
+class TrainingWorker(QThread):
+    """Background thread for model training."""
+    epoch_done = pyqtSignal(int, int, float, float)
+    training_complete = pyqtSignal(float, str)
+    training_error = pyqtSignal(str)
+    progress_update = pyqtSignal(str)
+    
+    def __init__(self, model, train_loader, val_loader, device, epochs, class_labels):
+        super().__init__()
+        self.model = model
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.device = device
+        self.epochs = epochs
+        self.class_labels = class_labels
+        self.running = True
+        
+    def run(self):
+        try:
+            criterion = torch.nn.CrossEntropyLoss()
+            optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4, weight_decay=1e-4)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs)
+            
+            best_val_acc = 0
+            best_state = None
+            
+            Path('checkpoints').mkdir(exist_ok=True)
+            
+            for epoch in range(self.epochs):
+                if not self.running:
+                    break
+                    
+                self.model.train()
+                train_loss = 0
+                train_correct = 0
+                train_total = 0
+                
+                for batch_x, batch_y in self.train_loader:
+                    batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
+                    
+                    optimizer.zero_grad()
+                    outputs = self.model(batch_x)
+                    loss = criterion(outputs, batch_y)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    optimizer.step()
+                    
+                    train_loss += loss.item()
+                    _, predicted = outputs.max(1)
+                    train_total += batch_y.size(0)
+                    train_correct += predicted.eq(batch_y).sum().item()
+                
+                train_acc = 100. * train_correct / train_total if train_total > 0 else 0
+                
+                self.model.eval()
+                val_correct = 0
+                val_total = 0
+                
+                with torch.no_grad():
+                    for batch_x, batch_y in self.val_loader:
+                        batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
+                        outputs = self.model(batch_x)
+                        _, predicted = outputs.max(1)
+                        val_total += batch_y.size(0)
+                        val_correct += predicted.eq(batch_y).sum().item()
+                
+                val_acc = 100. * val_correct / val_total if val_total > 0 else 0
+                
+                scheduler.step()
+                
+                self.epoch_done.emit(epoch + 1, self.epochs, train_acc, val_acc)
+                
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+            
+            if best_state:
+                torch.save({
+                    'epoch': self.epochs - 1,
+                    'model_state_dict': best_state,
+                    'val_acc': best_val_acc,
+                    'class_labels': self.class_labels
+                }, 'checkpoints/best_model.pt')
+            
+            self.training_complete.emit(best_val_acc, 'checkpoints/best_model.pt')
+            
+        except Exception as e:
+            self.training_error.emit(str(e))
+    
+    def cancel(self):
+        self.running = False
+
+
 class MainWindow(QMainWindow):
     """Main application window."""
     
@@ -216,10 +393,13 @@ class MainWindow(QMainWindow):
         self.class_labels = []
         self.dataset_samples = []
         self.dataset_labels = []
-        self.frame_buffer = deque(maxlen=30)
+        self.dataset_df = None
+        self.frame_buffer = deque(maxlen=DEFAULT_NUM_FRAMES)
         self.translator_thread = None
+        self.training_worker = None
         self.current_prediction = None
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.model_loaded = False
         
         self.setup_ui()
         self.load_settings()
@@ -290,7 +470,7 @@ class MainWindow(QMainWindow):
         
         self.num_frames_spin = QSpinBox()
         self.num_frames_spin.setRange(10, 100)
-        self.num_frames_spin.setValue(30)
+        self.num_frames_spin.setValue(DEFAULT_NUM_FRAMES)
         self.num_frames_spin.valueChanged.connect(self.update_settings)
         settings_layout.addRow("Sequence Length:", self.num_frames_spin)
         
@@ -358,13 +538,21 @@ class MainWindow(QMainWindow):
         load_group = QGroupBox("Load Dataset")
         load_layout = QVBoxLayout()
         
-        format_label = QLabel("Supported formats: JSON, CSV, Excel (.xlsx), NumPy (.npy)")
+        format_label = QLabel("Supported formats: JSON, CSV, Excel (.xlsx), NumPy (.npy), Pandas DataFrame")
         format_label.setStyleSheet("color: #666;")
         load_layout.addWidget(format_label)
         
+        btn_row = QHBoxLayout()
+        
         self.btn_load_dataset = QPushButton("Load Dataset File")
         self.btn_load_dataset.clicked.connect(self.load_dataset_file)
-        load_layout.addWidget(self.btn_load_dataset)
+        btn_row.addWidget(self.btn_load_dataset)
+        
+        self.btn_load_dataframe = QPushButton("Load from DataFrame")
+        self.btn_load_dataframe.clicked.connect(self.load_dataframe_dialog)
+        btn_row.addWidget(self.btn_load_dataframe)
+        
+        load_layout.addLayout(btn_row)
         
         self.dataset_info_label = QLabel("No dataset loaded")
         self.dataset_info_label.setStyleSheet("color: #888;")
@@ -396,15 +584,24 @@ class MainWindow(QMainWindow):
         self.batch_size_spin.setValue(8)
         train_layout.addRow("Batch Size:", self.batch_size_spin)
         
-        self.btn_train = QPushButton("Train Model")
-        self.btn_train.clicked.connect(self.train_model)
-        self.btn_train.setEnabled(False)
-        train_layout.addRow("", self.btn_train)
+        btn_train_row = QHBoxLayout()
         
-        self.train_log = QTextEdit()
-        self.train_log.setReadOnly(True)
-        self.train_log.setMaximumHeight(150)
-        train_layout.addRow("Training Log:", self.train_log)
+        self.btn_train = QPushButton("Train Model")
+        self.btn_train.clicked.connect(self.start_training)
+        self.btn_train.setEnabled(False)
+        btn_train_row.addWidget(self.btn_train)
+        
+        self.btn_cancel_train = QPushButton("Cancel")
+        self.btn_cancel_train.clicked.connect(self.cancel_training)
+        self.btn_cancel_train.setEnabled(False)
+        btn_train_row.addWidget(self.btn_cancel_train)
+        
+        train_layout.addRow("", btn_train_row)
+        
+        self.training_log_text = QTextEdit()
+        self.training_log_text.setReadOnly(True)
+        self.training_log_text.setMaximumHeight(150)
+        train_layout.addRow("Training Log:", self.training_log_text)
         
         train_group.setLayout(train_layout)
         layout.addWidget(train_group)
@@ -416,8 +613,8 @@ class MainWindow(QMainWindow):
     def log(self, message):
         self.log_text.append(message)
         
-    def train_log(self, message):
-        self.train_log.append(message)
+    def log_training(self, message):
+        self.training_log_text.append(message)
         
     def load_model(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Model File", "", "PyTorch (*.pt *.pth)")
@@ -425,36 +622,34 @@ class MainWindow(QMainWindow):
             return
             
         try:
-            checkpoint = torch.load(path, map_location=self.device)
+            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
             
             num_classes = len(self.class_labels) if self.class_labels else 100
             
-            if 'model_state_dict' in checkpoint:
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                 state_dict = checkpoint['model_state_dict']
-            else:
+            elif isinstance(checkpoint, dict):
                 state_dict = checkpoint
+            else:
+                raise ValueError("Invalid checkpoint format")
             
             for key, param in list(state_dict.items())[:10]:
                 if len(param.shape) == 4 and param.shape[1] in [1, 3]:
                     raise ValueError("This model appears to use image input (Conv2D with 1/3 input channels), but this app requires a landmark-based model.")
             
-            if 'model_state_dict' in checkpoint:
-                self.model = create_model(num_classes=num_classes)
-                self.model.load_state_dict(checkpoint['model_state_dict'])
-                self.log(f"Loaded model from {Path(path).name}")
-            else:
-                self.model = create_model(num_classes=num_classes)
-                self.model.load_state_dict(checkpoint)
-                self.log(f"Loaded model from {Path(path).name}")
-            
+            self.model = create_model(num_classes=num_classes)
+            self.model.load_state_dict(state_dict)
             self.model.to(self.device)
             self.model.eval()
+            
             self.model_path = path
             self.model_loaded = True
             self.model_label.setText(f"Model: {Path(path).name}")
             
             if self.class_labels:
                 self.btn_start.setEnabled(True)
+                
+            self.log(f"Loaded model from {Path(path).name}")
                 
         except Exception as e:
             self.log(f"Error: {str(e)}")
@@ -476,17 +671,13 @@ class MainWindow(QMainWindow):
             self.labels_path = path
             self.log(f"Loaded {len(self.class_labels)} classes: {', '.join(self.class_labels[:5])}...")
             
-            if hasattr(self, 'model_loaded') and self.model_loaded:
+            if self.model_loaded:
                 self.btn_start.setEnabled(True)
                     
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to load labels: {e}")
     
     def load_dataset_file(self):
-        if not PANDAS_AVAILABLE:
-            QMessageBox.warning(self, "Missing Dependency", "Pandas is required to load datasets.\nRun: pip install pandas openpyxl")
-            return
-            
         path, _ = QFileDialog.getOpenFileName(self, "Select Dataset File", "", 
                                               "Dataset Files (*.json *.csv *.xlsx *.xls *.npy);;All Files (*)")
         if not path:
@@ -495,42 +686,96 @@ class MainWindow(QMainWindow):
         try:
             samples, labels = load_dataset(path)
             
-            if samples is None:
-                raise ValueError("Could not parse dataset file")
+            if samples is None or len(samples) == 0:
+                raise ValueError("Could not parse dataset file or dataset is empty")
             
-            self.dataset_samples = samples
-            self.dataset_labels = labels
-            
-            unique_labels = sorted(list(set(labels)))
-            self.class_labels = unique_labels
-            
-            self.dataset_info_label.setText(f"Loaded {len(samples)} samples, {len(unique_labels)} classes")
-            self.log(f"Loaded dataset: {len(samples)} samples, {len(unique_labels)} classes")
-            
-            self.dataset_table.setRowCount(min(10, len(samples)))
-            self.dataset_table.setColumnCount(2)
-            self.dataset_table.setHorizontalHeaderLabels(["Sample Shape", "Label"])
-            
-            for i in range(min(10, len(samples))):
-                self.dataset_table.setItem(i, 0, QTableWidgetItem(str(samples[i].shape)))
-                self.dataset_table.setItem(i, 1, QTableWidgetItem(str(labels[i])))
-            
-            self.dataset_table.resizeColumnsToContents()
-            
-            if len(samples) > 0:
-                self.btn_train.setEnabled(True)
-            
-            label_path = Path(path).parent / "class_labels.json"
-            if not label_path.exists():
-                with open(label_path, 'w') as f:
-                    json.dump(unique_labels, f, indent=2)
-                self.log(f"Created class_labels.json at {label_path}")
+            self._apply_dataset(samples, labels)
+            self.log(f"Loaded dataset from file: {Path(path).name}")
             
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to load dataset:\n{str(e)}")
             self.log(f"Dataset error: {e}")
     
-    def train_model(self):
+    def load_dataframe_dialog(self):
+        """Show dialog for loading DataFrame from file."""
+        if not PANDAS_AVAILABLE:
+            QMessageBox.warning(self, "Missing Dependency", "Pandas is required.\nRun: pip install pandas openpyxl")
+            return
+            
+        path, _ = QFileDialog.getOpenFileName(self, "Select CSV/Excel File", "", 
+                                              "Tabular Files (*.csv *.xlsx *.xls);;All Files (*)")
+        if not path:
+            return
+        
+        try:
+            ext = Path(path).suffix.lower()
+            if ext == '.csv':
+                df = pd.read_csv(path)
+            else:
+                df = pd.read_excel(path)
+            
+            samples, labels = load_dataset_from_dataframe(df)
+            
+            if not samples:
+                raise ValueError("No valid samples found in DataFrame")
+            
+            self.dataset_df = df
+            self._apply_dataset(samples, labels)
+            self.log(f"Loaded DataFrame from: {Path(path).name}")
+            
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to load DataFrame:\n{str(e)}")
+            self.log(f"DataFrame error: {e}")
+    
+    def load_dataset_from_dataframe(self, df, label_column=None):
+        """Load dataset directly from a Pandas DataFrame.
+        
+        This method can be called programmatically or via the UI dialog.
+        
+        Args:
+            df: Pandas DataFrame with landmark data
+            label_column: Name of the label column (auto-detected if None)
+        """
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("Input must be a Pandas DataFrame")
+        
+        samples, labels = load_dataset_from_dataframe(df, label_column)
+        
+        if not samples:
+            raise ValueError("No valid samples found in DataFrame")
+        
+        self.dataset_df = df
+        self._apply_dataset(samples, labels)
+        self.log(f"Loaded DataFrame with {len(samples)} samples, {len(self.class_labels)} classes")
+        
+        return samples, labels
+    
+    def _apply_dataset(self, samples, labels):
+        """Apply loaded dataset to the app state."""
+        self.dataset_samples = samples
+        self.dataset_labels = labels
+        
+        unique_labels = sorted(set(labels))
+        self.class_labels = unique_labels
+        
+        self.dataset_info_label.setText(f"Loaded {len(samples)} samples, {len(unique_labels)} classes")
+        self.log(f"Dataset: {len(samples)} samples, {len(unique_labels)} classes")
+        
+        preview_count = min(10, len(samples))
+        self.dataset_table.setRowCount(preview_count)
+        self.dataset_table.setColumnCount(2)
+        self.dataset_table.setHorizontalHeaderLabels(["Sample Shape", "Label"])
+        
+        for i in range(preview_count):
+            shape_str = str(samples[i].shape) if hasattr(samples[i], 'shape') else str(type(samples[i]))
+            self.dataset_table.setItem(i, 0, QTableWidgetItem(shape_str))
+            self.dataset_table.setItem(i, 1, QTableWidgetItem(str(labels[i])))
+        
+        self.dataset_table.resizeColumnsToContents()
+        
+        self.btn_train.setEnabled(True)
+        
+    def start_training(self):
         if not self.dataset_samples:
             QMessageBox.warning(self, "Error", "No dataset loaded")
             return
@@ -539,13 +784,19 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "No classes found in dataset")
             return
         
+        if len(self.dataset_samples) < 2:
+            QMessageBox.warning(self, "Error", "Need at least 2 samples to train")
+            return
+        
         self.btn_train.setEnabled(False)
-        self.train_log("Starting training...")
+        self.btn_cancel_train.setEnabled(True)
+        self.training_log_text.clear()
+        self.log_training("Starting training...")
         
         try:
             num_classes = len(self.class_labels)
-            self.model = create_model(num_classes=num_classes)
-            self.model.to(self.device)
+            model = create_model(num_classes=num_classes)
+            model.to(self.device)
             
             label_to_idx = {label: idx for idx, label in enumerate(self.class_labels)}
             labels = [label_to_idx[l] for l in self.dataset_labels]
@@ -553,28 +804,32 @@ class MainWindow(QMainWindow):
             sequences = []
             for sample in self.dataset_samples:
                 if sample.ndim == 1:
-                    num_frames = len(sample) // 126
-                    seq = sample.reshape(num_frames, 126)
+                    num_frames = len(sample) // INPUT_DIM
+                    seq = sample.reshape(num_frames, INPUT_DIM)
                 else:
                     seq = sample
                 
-                if seq.shape[0] < 30:
-                    padding = np.zeros((30 - seq.shape[0], 126), dtype=np.float32)
+                if seq.shape[0] < DEFAULT_NUM_FRAMES:
+                    padding = np.zeros((DEFAULT_NUM_FRAMES - seq.shape[0], INPUT_DIM), dtype=np.float32)
                     seq = np.vstack([seq, padding])
                 else:
-                    seq = seq[:30]
+                    seq = seq[:DEFAULT_NUM_FRAMES]
                 
                 sequences.append(seq)
             
             sequences = np.array(sequences, dtype=np.float32)
-            labels = np.array(labels)
+            labels = np.array(labels, dtype=np.int64)
             
             dataset_size = len(sequences)
-            train_size = int(0.8 * dataset_size)
+            train_size = max(1, int(0.8 * dataset_size))
             indices = np.random.permutation(dataset_size)
             
             train_indices = indices[:train_size]
             val_indices = indices[train_size:]
+            
+            if len(val_indices) == 0:
+                val_indices = train_indices[-1:]
+                train_indices = train_indices[:-1]
             
             train_dataset = torch.utils.data.TensorDataset(
                 torch.FloatTensor(sequences[train_indices]),
@@ -585,69 +840,46 @@ class MainWindow(QMainWindow):
                 torch.LongTensor(labels[val_indices])
             )
             
-            train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=self.batch_size_spin.value(), shuffle=True)
-            val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=self.batch_size_spin.value())
+            actual_batch_size = min(self.batch_size_spin.value(), len(train_dataset))
+            train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=actual_batch_size, shuffle=True)
+            val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=actual_batch_size)
             
-            criterion = torch.nn.CrossEntropyLoss()
-            optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4, weight_decay=1e-4)
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs_spin.value())
+            self.training_worker = TrainingWorker(
+                model, train_loader, val_loader, self.device,
+                self.epochs_spin.value(), self.class_labels
+            )
             
-            best_val_acc = 0
+            self.training_worker.epoch_done.connect(self.on_epoch_done)
+            self.training_worker.training_complete.connect(self.on_training_complete)
+            self.training_worker.training_error.connect(self.on_training_error)
             
-            for epoch in range(self.epochs_spin.value()):
-                self.model.train()
-                train_loss = 0
-                train_correct = 0
-                train_total = 0
-                
-                for batch_x, batch_y in train_loader:
-                    batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
-                    
-                    optimizer.zero_grad()
-                    outputs = self.model(batch_x)
-                    loss = criterion(outputs, batch_y)
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                    optimizer.step()
-                    
-                    train_loss += loss.item()
-                    _, predicted = outputs.max(1)
-                    train_total += batch_y.size(0)
-                    train_correct += predicted.eq(batch_y).sum().item()
-                
-                train_acc = 100. * train_correct / train_total
-                
-                self.model.eval()
-                val_correct = 0
-                val_total = 0
-                
-                with torch.no_grad():
-                    for batch_x, batch_y in val_loader:
-                        batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
-                        outputs = self.model(batch_x)
-                        _, predicted = outputs.max(1)
-                        val_total += batch_y.size(0)
-                        val_correct += predicted.eq(batch_y).sum().item()
-                
-                val_acc = 100. * val_correct / val_total if val_total > 0 else 0
-                
-                scheduler.step()
-                
-                self.train_log(f"Epoch {epoch+1}/{self.epochs_spin.value()} - Train: {train_acc:.1f}% Val: {val_acc:.1f}%")
-                
-                if val_acc > best_val_acc:
-                    best_val_acc = val_acc
-                    torch.save({
-                        'epoch': epoch,
-                        'model_state_dict': self.model.state_dict(),
-                        'val_acc': val_acc,
-                        'class_labels': self.class_labels
-                    }, 'checkpoints/best_model.pt')
+            self.training_worker.start()
             
-            self.train_log(f"Training complete! Best val accuracy: {best_val_acc:.1f}%")
-            
-            checkpoint = torch.load('checkpoints/best_model.pt', map_location=self.device)
+        except Exception as e:
+            self.log_training(f"Error: {str(e)}")
+            self.log_training(traceback.format_exc())
+            QMessageBox.warning(self, "Training Error", str(e))
+            self.btn_train.setEnabled(True)
+            self.btn_cancel_train.setEnabled(False)
+    
+    def cancel_training(self):
+        if self.training_worker:
+            self.training_worker.cancel()
+            self.log_training("Training cancelled")
+            self.btn_train.setEnabled(True)
+            self.btn_cancel_train.setEnabled(False)
+    
+    def on_epoch_done(self, epoch, total_epochs, train_acc, val_acc):
+        self.log_training(f"Epoch {epoch}/{total_epochs} - Train: {train_acc:.1f}% Val: {val_acc:.1f}%")
+    
+    def on_training_complete(self, best_val_acc, save_path):
+        self.log_training(f"Training complete! Best val accuracy: {best_val_acc:.1f}%")
+        
+        try:
+            checkpoint = torch.load(save_path, map_location=self.device, weights_only=False)
+            self.model = create_model(num_classes=len(self.class_labels))
             self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.model.to(self.device)
             self.model.eval()
             
             self.model_loaded = True
@@ -656,15 +888,21 @@ class MainWindow(QMainWindow):
             
             self.log("Model trained and ready!")
             
-            QMessageBox.information(self, "Training Complete", f"Model trained with {best_val_acc:.1f}% validation accuracy.\nSaved to checkpoints/best_model.pt")
-            
+            QMessageBox.information(self, "Training Complete", 
+                                   f"Model trained with {best_val_acc:.1f}% validation accuracy.\nSaved to {save_path}")
         except Exception as e:
-            self.train_log(f"Error: {str(e)}")
-            self.train_log(traceback.format_exc())
-            QMessageBox.warning(self, "Training Error", str(e))
+            self.log(f"Error loading trained model: {e}")
         
-        finally:
-            self.btn_train.setEnabled(True)
+        self.btn_train.setEnabled(True)
+        self.btn_cancel_train.setEnabled(False)
+        self.training_worker = None
+    
+    def on_training_error(self, error_msg):
+        self.log_training(f"Training error: {error_msg}")
+        QMessageBox.warning(self, "Training Error", error_msg)
+        self.btn_train.setEnabled(True)
+        self.btn_cancel_train.setEnabled(False)
+        self.training_worker = None
                 
     def start_camera(self):
         if not MEDIAPIPE_AVAILABLE:
@@ -708,8 +946,9 @@ class MainWindow(QMainWindow):
             
         h, w = frame.shape[:2]
         rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
         bytes_per_line = 3 * w
-        qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
         
         scaled = qt_image.scaled(self.video_label.size(), Qt.KeepAspectRatio)
         self.video_label.setPixmap(QPixmap.fromImage(scaled))
@@ -725,7 +964,7 @@ class MainWindow(QMainWindow):
             sequence = np.array(list(self.frame_buffer), dtype=np.float32)
             
             if sequence.shape[0] < self.num_frames_spin.value():
-                padding = np.zeros((self.num_frames_spin.value() - sequence.shape[0], 126), dtype=np.float32)
+                padding = np.zeros((self.num_frames_spin.value() - sequence.shape[0], INPUT_DIM), dtype=np.float32)
                 sequence = np.vstack([sequence, padding])
             
             sequence = torch.FloatTensor(sequence).unsqueeze(0).to(self.device)
@@ -764,7 +1003,7 @@ class MainWindow(QMainWindow):
             try:
                 with open(settings_file, 'r') as f:
                     settings = json.load(f)
-                    self.num_frames_spin.setValue(settings.get('num_frames', 30))
+                    self.num_frames_spin.setValue(settings.get('num_frames', DEFAULT_NUM_FRAMES))
                     self.confidence_spin.setValue(settings.get('confidence', 0.7))
                     self.camera_spin.setValue(settings.get('camera_index', 0))
             except:
@@ -774,6 +1013,10 @@ class MainWindow(QMainWindow):
         if self.translator_thread:
             self.translator_thread.stop()
             self.translator_thread = None
+            
+        if self.training_worker:
+            self.training_worker.cancel()
+            self.training_worker.wait(2000)
             
         settings = {
             'num_frames': self.num_frames_spin.value(),
